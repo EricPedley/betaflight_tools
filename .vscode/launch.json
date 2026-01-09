@@ -1,0 +1,14 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Estimate Dynamics",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/system_identification/estimate_dynamics.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": ["logs/btfl_002.01.csv"]
+        }
+    ]
+}
