@@ -10,6 +10,8 @@ from pathlib import Path
 
 try:
     import pandas as pd
+    import numpy as np
+    import scipy
 except ImportError as e:
     print(f"Error: {e}")
     print("\nPlease install required packages:")
@@ -46,11 +48,10 @@ def load_flight_log(csv_path):
         print(f"Warning: Motor columns not found. Available columns: {list(df.columns)}")
         motor_output = None
 
-    # Extract eRPM columns as numpy array
-    # Average across all 4 motors for a single eRPM value per row
+    # Extract eRPM columns as numpy array (n, 4) shape
     erpm_cols = ['eRPM[0]', 'eRPM[1]', 'eRPM[2]', 'eRPM[3]']
     if all(col in df.columns for col in erpm_cols):
-        erpm = df[erpm_cols].mean(axis=1).values
+        erpm = df[erpm_cols].values
         print(f"eRPM shape: {erpm.shape}")
     else:
         print(f"Warning: eRPM columns not found. Available columns: {list(df.columns)}")
@@ -67,6 +68,15 @@ def load_flight_log(csv_path):
 
     return df, motor_output, erpm, acc_z
 
+def estimate_thrust_curve(erpm: np.ndarray, acc_z: np.ndarray):
+    A = np.array([
+        [1, np.sum(omega), np.sum(np.square(omega))]
+        for omega in erpm
+    ])
+    b = acc_z
+    x, residuals, rank, s = np.linalg.lstsq(A, b, rcond=None)
+    return x
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -80,6 +90,7 @@ def main():
 
     args = parser.parse_args()
     _, motor_output, erpm, acc_z = load_flight_log(args.csv_file)
+    estimate_thrust_curve(erpm, acc_z)
 
     # Example: Print first few values
     if motor_output is not None:
