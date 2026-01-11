@@ -150,6 +150,111 @@ def estimate_time_delay(erpm_mean: np.ndarray, acc_z: np.ndarray, sample_rate: f
 
     return delay_ms, max_corr, correlation, lags
 
+def fit_arx_model(erpm: np.ndarray, acc_z: np.ndarray, na: int = 2, nb: int = 1):
+    """
+    Fit ARX(na, nb) model to capture dynamics: A(q)·y = B(q)·u + e
+    Uses polynomial basis for inputs: [1, Σω, Σω²]
+
+    Args:
+        erpm: eRPM array with shape (n, 4) for 4 motors
+        acc_z: Accelerometer Z readings (n,)
+        na: Order of A polynomial (output autoregression)
+        nb: Order of B polynomial (input coefficients)
+
+    Returns:
+        theta: ARX coefficients [a1, a2, ..., ana, b0_0, b0_1, b0_2, b1_0, b1_1, b1_2, ...]
+               where b{i}_{j} is coefficient for u(k-i) polynomial term j ([1, Σω, Σω²])
+        poles: Poles of the discrete system
+        stable: Boolean indicating if all poles are inside unit circle
+    """
+    n = len(acc_z)
+    max_lag = max(na, nb)
+    n_poly_features = 3  # [1, sum(omega), sum(omega^2)]
+
+    # Build regression matrix
+    # Each row: [y(k-1), y(k-2), ..., y(k-na), 1, Σω(k), Σω²(k), 1, Σω(k-1), Σω²(k-1), ...]
+    n_features = na + (nb + 1) * n_poly_features
+    X = np.zeros((n - max_lag, n_features))
+    y_target = acc_z[max_lag:]
+
+    for i in range(max_lag, n):
+        # Past outputs (for ARX, we want: y(k) + a1*y(k-1) + a2*y(k-2) = b0*u(k) + b1*u(k-1) + ...)
+        # So the regression matrix has -y(k-1), -y(k-2), ... to move them to RHS
+        for j in range(na):
+            X[i - max_lag, j] = -acc_z[i - 1 - j]
+
+        # Current and past inputs (use polynomial basis of eRPM as in static model)
+        # Static model: y = a0 + a1*sum(omega) + a2*sum(omega^2)
+        for j in range(nb + 1):
+            idx = i - j
+            if idx >= 0:
+                # Create polynomial feature vector: [1, sum_omega, sum_omega^2]
+                u_features = [1, np.sum(erpm[idx]), np.sum(np.square(erpm[idx]))]
+                # Place all 3 features for this time lag
+                for k, feature in enumerate(u_features):
+                    X[i - max_lag, na + j * n_poly_features + k] = feature
+
+    # Solve least squares
+    theta, _, _, _ = np.linalg.lstsq(X, y_target, rcond=None)
+
+    # Extract A and B coefficients for stability analysis
+    a_coeffs = np.concatenate([[1], theta[:na]])  # [1, a1, a2, ...]
+
+    # Compute poles from A polynomial (characteristic equation)
+    # Poles are roots of: z^na + a1*z^(na-1) + a2*z^(na-2) + ... + ana
+    poles = np.roots(a_coeffs)
+
+    # Check stability: all poles must be inside unit circle |z| < 1
+    stable = np.all(np.abs(poles) < 1.0)
+
+    return theta, poles, stable
+
+def predict_arx(theta: np.ndarray, erpm: np.ndarray, acc_z: np.ndarray, na: int = 2, nb: int = 1):
+    """
+    Generate predictions using fitted ARX model.
+    Uses actual values during initial transient, then switches to recursive prediction.
+    Uses polynomial basis for inputs: [1, Σω, Σω²]
+
+    Args:
+        theta: ARX coefficients from fit_arx_model()
+        erpm: eRPM input array (n, 4)
+        acc_z: Accelerometer readings for initialization (n,)
+        na: Order of A polynomial
+        nb: Order of B polynomial
+
+    Returns:
+        y_pred: Predicted accelerometer values
+    """
+    n = len(acc_z)
+    max_lag = max(na, nb)
+    n_poly_features = 3  # [1, sum(omega), sum(omega^2)]
+
+    # Initialize with actual values (warmup period)
+    y_pred = acc_z.copy()
+
+    for k in range(max_lag, n):
+        pred = 0
+
+        # Autoregressive part: -a1*y(k-1) - a2*y(k-2) - ...
+        # Use actual values from training set for stability during initialization
+        for i in range(na):
+            pred += theta[i] * acc_z[k - 1 - i]
+
+        # Input part: [b0_0, b0_1, b0_2]·u(k) + [b1_0, b1_1, b1_2]·u(k-1) + ...
+        # Using full polynomial basis [1, sum(omega), sum(omega^2)]
+        for i in range(nb + 1):
+            idx = k - i
+            if idx >= 0:
+                u_features = [1, np.sum(erpm[idx]), np.sum(np.square(erpm[idx]))]
+                # Sum contributions from all 3 polynomial terms
+                for k_feat, feature in enumerate(u_features):
+                    theta_idx = na + i * n_poly_features + k_feat
+                    pred += theta[theta_idx] * feature
+
+        y_pred[k] = pred
+
+    return y_pred
+
 def validate_delay_compensation(erpm: np.ndarray, residuals_trimmed: np.ndarray, residuals_shifted: np.ndarray, sample_rate: float, delay_ms: float, plot: bool = True):
     """
     Validate delay compensation by computing cross-correlations between residuals and individual eRPM channels,
@@ -281,7 +386,7 @@ def validate_delay_compensation(erpm: np.ndarray, residuals_trimmed: np.ndarray,
         print(f"Plot saved to {figures_dir / 'autocorr_residuals.png'}")
         plt.close(fig)
 
-def estimate_thrust_curve(erpm: np.ndarray, acc_z: np.ndarray, plot: bool = True, sample_rate: float = None):
+def estimate_thrust_curve(erpm: np.ndarray, acc_z: np.ndarray, plot: bool = True, sample_rate: float = None, use_dynamics: bool = False):
     # Calculate residuals from full dataset
     A_full = np.array([
         [1, np.sum(omega), np.sum(np.square(omega))]
@@ -337,13 +442,60 @@ def estimate_thrust_curve(erpm: np.ndarray, acc_z: np.ndarray, plot: bool = True
     print(f"Original model residual std: {np.std(residuals_full[start_idx:end_idx+1]):.4f}")
     print(f"Delay-compensated residual std: {np.std(residuals_shifted):.4f}")
 
+    # Calculate residual statistics (needed for both dynamics and plotting)
+    residuals_trimmed = b_trimmed - (A_trimmed @ x)
+
+    # Fit ARX dynamics model if requested
+    residuals_arx = None
+    arx_theta = None
+    arx_poles = None
+    arx_stable = False
+
+    if use_dynamics:
+        print("\n=== Fitting ARX(2,1) Dynamics Model ===")
+        # Fit ARX model on residuals from static model to understand residual structure
+        arx_theta, arx_poles, arx_stable = fit_arx_model(erpm_trimmed, residuals_trimmed, na=2, nb=1)
+
+        print(f"ARX coefficients: {arx_theta}")
+        print(f"ARX poles: {arx_poles}")
+        print(f"Stable: {arx_stable}")
+        print(f"\nARX Model Analysis (with polynomial basis [1, Σω, Σω²]):")
+        # na=2 AR coefficients
+        print(f"  AR Terms:")
+        print(f"    a1 (lag-1 coeff): {arx_theta[0]:.6f} (captures autocorrelation)")
+        print(f"    a2 (lag-2 coeff): {arx_theta[1]:.6f}")
+        # Input terms with polynomial features
+        print(f"  Current u(k) coefficients [1, Σω, Σω²]:")
+        print(f"    b0_0 (intercept): {arx_theta[2]:.6f}")
+        print(f"    b0_1 (Σω):        {arx_theta[3]:.6f}")
+        print(f"    b0_2 (Σω²):       {arx_theta[4]:.6f}")
+        print(f"  Past u(k-1) coefficients [1, Σω, Σω²]:")
+        print(f"    b1_0 (intercept): {arx_theta[5]:.6f}")
+        print(f"    b1_1 (Σω):        {arx_theta[6]:.6f}")
+        print(f"    b1_2 (Σω²):       {arx_theta[7]:.6f}")
+
+        # Use ARX model to explain residual autocorrelation structure
+        # Measure how much the ARX model explains the autocorrelation
+        autocorr_static = correlate(residuals_trimmed - np.mean(residuals_trimmed),
+                                     residuals_trimmed - np.mean(residuals_trimmed), mode='full')
+        autocorr_static /= np.max(autocorr_static)
+
+        center_idx = len(autocorr_static) // 2
+        lag_1_idx = center_idx + 1
+
+        # The ARX coefficient a1 directly relates to autocorrelation
+        print(f"\nAutocorrelation at lag-1: {autocorr_static[lag_1_idx]:.4f}")
+        print(f"ARX a1 coefficient:       {-arx_theta[0]:.4f} (should be similar)")
+
+        # Set residuals_arx to None since we're not using it for prediction
+        residuals_arx = None
+
     if plot:
         figures_dir = Path('figures')
         figures_dir.mkdir(exist_ok=True)
 
         # Calculate estimated thrust using trimmed-data coefficients
         estimated_thrust = A_full @ x
-        residuals_trimmed = b_trimmed - (A_trimmed @ x)
 
         # Calculate residual statistics for threshold lines (centered at 0)
         std_residuals = np.std(residuals_full)
@@ -411,6 +563,58 @@ def estimate_thrust_curve(erpm: np.ndarray, acc_z: np.ndarray, plot: bool = True
         print(f"Plot saved to {figures_dir / 'thrust_curve_estimation.png'}")
         plt.close(fig)
 
+        # Plot 4: ARX autocorrelation comparison (if dynamics model was fit)
+        if use_dynamics and residuals_arx is not None:
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+            fig.suptitle('Static vs ARX Model Comparison', fontsize=14)
+
+            lags = np.arange(-len(residuals_trimmed) + 1, len(residuals_trimmed))
+            lags_ms = (lags / sample_rate) * 1000
+
+            # Compute autocorrelations
+            autocorr_static = correlate(residuals_trimmed - np.mean(residuals_trimmed),
+                                       residuals_trimmed - np.mean(residuals_trimmed), mode='full')
+            autocorr_static /= np.max(autocorr_static)
+
+            autocorr_arx_plot = correlate(residuals_arx - np.mean(residuals_arx),
+                                          residuals_arx - np.mean(residuals_arx), mode='full')
+            autocorr_arx_plot /= np.max(autocorr_arx_plot)
+
+            # Left: Autocorrelation comparison (±50ms zoom)
+            max_lag_ms_zoom = 50
+            max_lag_idx_zoom = np.searchsorted(lags_ms, max_lag_ms_zoom, side='left')
+            min_lag_idx_zoom = np.searchsorted(lags_ms, -max_lag_ms_zoom, side='right')
+
+            ax = axes[0]
+            ax.plot(lags_ms[min_lag_idx_zoom:max_lag_idx_zoom], autocorr_static[min_lag_idx_zoom:max_lag_idx_zoom],
+                    label='Static model', linewidth=2, alpha=0.7)
+            ax.plot(lags_ms[min_lag_idx_zoom:max_lag_idx_zoom], autocorr_arx_plot[min_lag_idx_zoom:max_lag_idx_zoom],
+                    label='ARX model', linewidth=2, alpha=0.7)
+            ax.axvline(x=0, color='r', linestyle='--', alpha=0.5, label='Zero lag')
+            ax.axhline(y=0, color='gray', linestyle='-', alpha=0.3)
+            ax.set_xlabel('Lag (ms)')
+            ax.set_ylabel('Normalized Autocorrelation')
+            ax.set_title('Autocorrelation Comparison (±50 ms)')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+            # Right: Residual time series sample (first 1000 samples of trimmed data)
+            sample_len = min(1000, len(residuals_trimmed))
+            ax = axes[1]
+            ax.plot(range(sample_len), residuals_trimmed[:sample_len], label='Static model', linewidth=1, alpha=0.7)
+            ax.plot(range(sample_len), residuals_arx[:sample_len], label='ARX model', linewidth=1, alpha=0.7)
+            ax.axhline(y=0, color='r', linestyle='--', alpha=0.5)
+            ax.set_xlabel('Sample Index (trimmed data)')
+            ax.set_ylabel('Residual')
+            ax.set_title('Residual Time Series (First 1000 Samples)')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+            fig.tight_layout()
+            fig.savefig(figures_dir / 'autocorr_comparison.png', dpi=150, bbox_inches='tight')
+            print(f"Plot saved to {figures_dir / 'autocorr_comparison.png'}")
+            plt.close(fig)
+
         # Validation: Cross-correlation between residuals and individual eRPM channels
         print("\n=== Residual-eRPM Cross-Correlation Validation ===")
         validate_delay_compensation(erpm_trimmed, residuals_trimmed, residuals_shifted, sample_rate, delay_ms, plot=True)
@@ -430,7 +634,7 @@ def main():
 
     args = parser.parse_args()
     _, motor_output, erpm, acc_z = load_flight_log(args.csv_file)
-    estimate_thrust_curve(erpm, acc_z, plot=True)
+    estimate_thrust_curve(erpm, acc_z, plot=True, use_dynamics=True)
 
     # Example: Print first few values
     if motor_output is not None:
