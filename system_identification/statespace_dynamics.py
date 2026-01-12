@@ -120,6 +120,48 @@ def normalize_data(
     return normalized, mean, std
 
 
+def detect_residual_cutoffs(residuals: np.ndarray) -> tuple[int, int]:
+    """
+    Detect cutoff indices by finding the longest contiguous block
+    where residuals are within ±threshold of zero (centered at 0).
+
+    Args:
+        residuals: (T,) array of residuals
+
+    Returns:
+        start_idx: Start index of good data region
+        end_idx: End index of good data region
+    """
+    std = np.std(residuals)
+    threshold = 1.3 * std
+
+    # Find where residuals are within ±threshold of zero
+    within_threshold = np.abs(residuals) <= threshold
+
+    if not np.any(within_threshold):
+        # No data within threshold, return full range
+        return 0, len(residuals) - 1
+
+    # Find contiguous blocks using diff
+    # Add padding to handle edges
+    padded = np.pad(within_threshold, (1, 1), constant_values=False)
+    diff = np.diff(padded.astype(int))
+
+    # Start indices where diff == 1 (False -> True)
+    starts = np.where(diff == 1)[0]
+    # End indices where diff == -1 (True -> False)
+    ends = np.where(diff == -1)[0]
+
+    # Find longest block
+    block_lengths = ends - starts
+    longest_idx = np.argmax(block_lengths)
+
+    start_idx = starts[longest_idx]
+    end_idx = ends[longest_idx]
+
+    return start_idx, end_idx
+
+
 def stable_random_init(
     key: jax.Array,
     state_dim: int,
@@ -188,6 +230,94 @@ def simulate_statespace(
 simulate_statespace_jit = jax.jit(simulate_statespace)
 
 
+def trim_data_by_residuals(
+    u_data: jnp.ndarray,
+    z_data: jnp.ndarray,
+    state_dim: int = 8,
+    maxiter_initial: int = 20,
+    seed: int = 42,
+    verbose: bool = True,
+) -> tuple[jnp.ndarray, jnp.ndarray, int, int]:
+    """
+    Fit initial model and trim data to most consistent region.
+
+    Args:
+        u_data: (T, 4) input data
+        z_data: (T, 12) output data
+        state_dim: State dimension for initial fit (smaller = faster)
+        maxiter_initial: Max iterations for initial fit
+        seed: Random seed
+        verbose: Print progress
+
+    Returns:
+        u_trimmed: Trimmed input data
+        z_trimmed: Trimmed output data
+        start_idx: Start index of trimmed region
+        end_idx: End index of trimmed region
+    """
+    if verbose:
+        print("\n=== Trimming data by residual analysis ===")
+        print(f"  Initial data length: {len(u_data)} samples")
+
+    # Fit quick initial model on middle 50% of data
+    mid_start = len(u_data) // 4
+    mid_end = 3 * len(u_data) // 4
+
+    # Initialize parameters
+    key = jax.random.PRNGKey(seed)
+    init_params = stable_random_init(key, state_dim)
+    n_x = init_params['A'].shape[0]
+    n_u = init_params['B'].shape[1]
+    n_z = init_params['C'].shape[0]
+    init_params_flat = jnp.concatenate([
+        init_params['A'].flatten(),
+        init_params['B'].flatten(),
+        init_params['C'].flatten(),
+    ])
+
+    # Fit on middle section
+    def residual_fn(params: jnp.ndarray):
+        A = params[:n_x*n_x].reshape((n_x, n_x))
+        B = params[n_x*n_x: n_x*n_x+n_x*n_u].reshape((n_x, n_u))
+        C = params[n_x*n_x+n_x*n_u:].reshape((n_z, n_x))
+        z_pred = simulate_statespace(A, B, C, u_data[mid_start:mid_end], jnp.zeros(A.shape[0]))
+        return (z_pred - z_data[mid_start:mid_end]).ravel()
+
+    solver = jaxopt.LevenbergMarquardt(
+        residual_fun=residual_fn,
+        maxiter=maxiter_initial,
+        tol=1e-6,
+        verbose=False,
+    )
+    result = solver.run(init_params_flat)
+
+    # Extract fitted params
+    params_flat = result.params
+    A = params_flat[:n_x*n_x].reshape((n_x, n_x))
+    B = params_flat[n_x*n_x: n_x*n_x+n_x*n_u].reshape((n_x, n_u))
+    C = params_flat[n_x*n_x+n_x*n_u:].reshape((n_z, n_x))
+
+    # Compute residuals on full data
+    z_pred_full = simulate_statespace(A, B, C, u_data, jnp.zeros(A.shape[0]))
+    residuals_full = z_data - z_pred_full
+
+    # Use mean squared residual across all channels as the metric
+    residuals_mean = np.array(jnp.mean(residuals_full ** 2, axis=1))
+
+    # Detect cutoffs
+    start_idx, end_idx = detect_residual_cutoffs(residuals_mean)
+
+    if verbose:
+        print(f"  Detected cutoffs: start={start_idx}, end={end_idx}")
+        print(f"  Trimmed data length: {end_idx - start_idx + 1} samples")
+        print(f"  Kept {100 * (end_idx - start_idx + 1) / len(u_data):.1f}% of data")
+
+    u_trimmed = u_data[start_idx:end_idx+1]
+    z_trimmed = z_data[start_idx:end_idx+1]
+
+    return u_trimmed, z_trimmed, start_idx, end_idx
+
+
 def fit_statespace_model(
     u_data: jnp.ndarray,
     z_data: jnp.ndarray,
@@ -252,7 +382,7 @@ def fit_statespace_model(
     result = solver.run(init_params_flat)
 
     if verbose:
-        stability = check_stability(result.params['A'])
+        stability = check_stability(result.params[:n_x*n_x].reshape((n_x, n_x)))
         print(f"  Final spectral radius: {stability['spectral_radius']:.4f}")
         print(f"  Stable: {stability['is_stable']}")
 
@@ -428,6 +558,11 @@ def main():
         action="store_true",
         help="Disable plot generation"
     )
+    parser.add_argument(
+        "--trim-data",
+        action="store_true",
+        help="Trim data to most consistent region using residual analysis"
+    )
 
     args = parser.parse_args()
 
@@ -441,16 +576,36 @@ def main():
     print(f"\nInput stats - mean: {np.array(u_mean)}, std: {np.array(u_std)}")
     print(f"Output stats - mean range: [{float(z_mean.min()):.2f}, {float(z_mean.max()):.2f}]")
 
+    # Optional: Trim data to best region
+    if args.trim_data:
+        u_norm, z_norm, start_idx, end_idx = trim_data_by_residuals(
+            u_norm, z_norm,
+            state_dim=8,  # Use smaller state for initial fit
+            maxiter_initial=20,
+            seed=args.seed,
+            verbose=True
+        )
+
     # Fit model
-    params, opt_state = fit_statespace_model(
+    params_flat, opt_state = fit_statespace_model(
         u_norm, z_norm,
         state_dim=args.state_dim,
         maxiter=args.maxiter,
         seed=args.seed,
+        verbose=True
     )
 
+    # Extract parameters from flat array
+    n_x = args.state_dim
+    n_u = INPUT_DIM
+    n_z = OUTPUT_DIM
+    A = params_flat[:n_x*n_x].reshape((n_x, n_x))
+    B = params_flat[n_x*n_x: n_x*n_x+n_x*n_u].reshape((n_x, n_u))
+    C = params_flat[n_x*n_x+n_x*n_u:].reshape((n_z, n_x))
+    params = {'A': A, 'B': B, 'C': C}
+
     # Compute predictions and metrics
-    z_pred = simulate_statespace_jit(params, u_norm)
+    z_pred = simulate_statespace(A, B, C, u_norm, jnp.zeros(n_x))
     metrics = compute_fit_metrics(z_norm, z_pred)
 
     # Print results
